@@ -46,6 +46,51 @@ func ListenSerial(ctx context.Context, dialer Dialer, destination M.Socksaddr, d
 	return nil, netip.Addr{}, E.Errors(connErrors...)
 }
 
+func DialTCPConcurrent(ctx context.Context, dialer Dialer, destination M.Socksaddr, destinationAddresses []netip.Addr) (net.Conn, error) {
+	if len(destinationAddresses) == 0 {
+		return nil, E.New("no addresses")
+	}
+	if len(destinationAddresses) == 1 {
+		return dialer.DialContext(ctx, NetworkTCP, M.SocksaddrFrom(destinationAddresses[0], destination.Port))
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	returned := make(chan struct{})
+	defer close(returned)
+	type dialResult struct {
+		net.Conn
+		error
+	}
+	results := make(chan dialResult)
+	for _, addr := range destinationAddresses {
+		go func(addr netip.Addr) {
+			conn, err := dialer.DialContext(ctx, NetworkTCP, M.SocksaddrFrom(addr, destination.Port))
+			if err != nil {
+				select {
+				case results <- dialResult{error: err}:
+				case <-returned:
+				}
+				return
+			}
+			select {
+			case <-returned:
+				conn.Close()
+			case results <- dialResult{Conn: conn}:
+			}
+		}(addr)
+	}
+	var connErrors []error
+	for range destinationAddresses {
+		res := <-results
+		if res.error == nil {
+			cancel()
+			return res.Conn, nil
+		}
+		connErrors = append(connErrors, res.error)
+	}
+	return nil, E.Errors(connErrors...)
+}
+
 func DialParallel(ctx context.Context, dialer Dialer, network string, destination M.Socksaddr, destinationAddresses []netip.Addr, preferIPv6 bool, fallbackDelay time.Duration) (net.Conn, error) {
 	// kanged form net.Dial
 
