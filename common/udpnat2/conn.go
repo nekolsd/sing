@@ -3,7 +3,6 @@ package udpnat
 import (
 	"io"
 	"net"
-	"net/netip"
 	"os"
 	"sync"
 	"time"
@@ -30,7 +29,8 @@ var (
 )
 
 type natConn struct {
-	cache           freelru.Cache[netip.AddrPort, *natConn]
+	cache           freelru.Cache[sessionKey, *natConn]
+	key             sessionKey
 	writer          N.PacketWriter
 	localAddr       M.Socksaddr
 	handlerAccess   sync.RWMutex
@@ -139,7 +139,7 @@ fetch:
 }
 
 func (c *natConn) Timeout() time.Duration {
-	rawConn, lifetime, loaded := c.cache.PeekWithLifetime(c.localAddr.AddrPort())
+	rawConn, lifetime, loaded := c.cache.PeekWithLifetime(c.key)
 	if !loaded || rawConn != c {
 		return 0
 	}
@@ -147,7 +147,7 @@ func (c *natConn) Timeout() time.Duration {
 }
 
 func (c *natConn) SetTimeout(timeout time.Duration) bool {
-	return c.cache.UpdateLifetime(c.localAddr.AddrPort(), c, timeout)
+	return c.cache.UpdateLifetime(c.key, c, timeout)
 }
 
 func (c *natConn) Close() error {
