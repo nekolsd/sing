@@ -15,25 +15,42 @@ import (
 )
 
 type Service struct {
-	cache   freelru.Cache[netip.AddrPort, *natConn]
+	cache   freelru.Cache[sessionKey, *natConn]
 	handler N.UDPConnectionHandlerEx
 	prepare PrepareFunc
+	mode    NATMode
 }
 
 type PrepareFunc func(source M.Socksaddr, destination M.Socksaddr, userData any) (bool, context.Context, N.PacketWriter, N.CloseHandlerFunc)
 
+type NATMode uint8
+
+const (
+	NATModeEndpointIndependent NATMode = iota
+	NATModeDestinationDependent
+)
+
+type sessionKey struct {
+	Source      netip.AddrPort
+	Destination netip.AddrPort
+}
+
 func New(handler N.UDPConnectionHandlerEx, prepare PrepareFunc, timeout time.Duration, shared bool) *Service {
+	return NewWithMode(handler, prepare, timeout, shared, NATModeEndpointIndependent)
+}
+
+func NewWithMode(handler N.UDPConnectionHandlerEx, prepare PrepareFunc, timeout time.Duration, shared bool, mode NATMode) *Service {
 	if timeout == 0 {
 		panic("invalid timeout")
 	}
-	var cache freelru.Cache[netip.AddrPort, *natConn]
+	var cache freelru.Cache[sessionKey, *natConn]
 	if !shared {
-		cache = common.Must1(freelru.NewSynced[netip.AddrPort, *natConn](1024, maphash.NewHasher[netip.AddrPort]().Hash32))
+		cache = common.Must1(freelru.NewSynced[sessionKey, *natConn](1024, maphash.NewHasher[sessionKey]().Hash32))
 	} else {
-		cache = common.Must1(freelru.NewSharded[netip.AddrPort, *natConn](1024, maphash.NewHasher[netip.AddrPort]().Hash32))
+		cache = common.Must1(freelru.NewSharded[sessionKey, *natConn](1024, maphash.NewHasher[sessionKey]().Hash32))
 	}
 	cache.SetLifetime(timeout)
-	cache.SetHealthCheck(func(port netip.AddrPort, conn *natConn) bool {
+	cache.SetHealthCheck(func(key sessionKey, conn *natConn) bool {
 		select {
 		case <-conn.doneChan:
 			return false
@@ -41,24 +58,27 @@ func New(handler N.UDPConnectionHandlerEx, prepare PrepareFunc, timeout time.Dur
 			return true
 		}
 	})
-	cache.SetOnEvict(func(_ netip.AddrPort, conn *natConn) {
+	cache.SetOnEvict(func(_ sessionKey, conn *natConn) {
 		conn.Close()
 	})
 	return &Service{
 		cache:   cache,
 		handler: handler,
 		prepare: prepare,
+		mode:    mode,
 	}
 }
 
 func (s *Service) NewPacket(bufferSlices [][]byte, source M.Socksaddr, destination M.Socksaddr, userData any) {
-	conn, _, ok := s.cache.GetAndRefreshOrAdd(source.AddrPort(), func() (*natConn, bool) {
+	key := s.sessionKey(source, destination)
+	conn, _, ok := s.cache.GetAndRefreshOrAdd(key, func() (*natConn, bool) {
 		ok, ctx, writer, onClose := s.prepare(source, destination, userData)
 		if !ok {
 			return nil, false
 		}
 		newConn := &natConn{
 			cache:        s.cache,
+			key:          key,
 			writer:       writer,
 			localAddr:    source,
 			packetChan:   make(chan *N.PacketBuffer, 64),
@@ -99,6 +119,14 @@ func (s *Service) NewPacket(bufferSlices [][]byte, source M.Socksaddr, destinati
 		packet.Buffer.Release()
 		N.PutPacketBuffer(packet)
 	}
+}
+
+func (s *Service) sessionKey(source M.Socksaddr, destination M.Socksaddr) sessionKey {
+	key := sessionKey{Source: source.AddrPort()}
+	if s.mode == NATModeDestinationDependent {
+		key.Destination = destination.AddrPort()
+	}
+	return key
 }
 
 func (s *Service) NewPacketBatch(buffers []*buf.Buffer, sources []M.Socksaddr, destination M.Socksaddr, userData any) {
